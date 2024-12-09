@@ -406,9 +406,11 @@ renderCUDA(
 	const float2* __restrict__ points_xy_image,
 	const float4* __restrict__ conic_opacity,
 	const float* __restrict__ colors,
+	const float* __restrict__ depths,
 	const float* __restrict__ final_Ts,
 	const uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ dL_dpixels,
+	const float* __restrict__ dL_depths,
 	float3* __restrict__ dL_dmean2D,
 	float4* __restrict__ dL_dconic2D,
 	float* __restrict__ dL_dopacity,
@@ -435,6 +437,8 @@ renderCUDA(
 	__shared__ float2 collected_xy[BLOCK_SIZE];
 	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
 	__shared__ float collected_colors[C * BLOCK_SIZE];
+	__shared__ float collected_depths[BLOCK_SIZE];
+	// __shared__ float collected_alphas[BLOCK_SIZE];
 
 	// In the forward, we stored the final value for T, the
 	// product of all (1 - alpha) factors. 
@@ -448,12 +452,19 @@ renderCUDA(
 
 	float accum_rec[C] = { 0 };
 	float dL_dpixel[C];
+	float dL_depth;
+	float dL_dT;
+	float accum_depth_rec = 0;
+	float accum_T_rec = T_final;
 	if (inside)
 		for (int i = 0; i < C; i++)
 			dL_dpixel[i] = dL_dpixels[i * H * W + pix_id];
+		dL_depth = dL_depths[pix_id];
+		dL_dT = dL_depths[H * W + pix_id];
 
 	float last_alpha = 0;
 	float last_color[C] = { 0 };
+	float last_depth = 0;
 
 	// Gradient of pixel coordinate w.r.t. normalized 
 	// screen-space viewport corrdinates (-1 to 1)
@@ -475,6 +486,7 @@ renderCUDA(
 			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
 			for (int i = 0; i < C; i++)
 				collected_colors[i * BLOCK_SIZE + block.thread_rank()] = colors[coll_id * C + i];
+			collected_depths[block.thread_rank()] = depths[coll_id];
 		}
 		block.sync();
 
@@ -522,7 +534,41 @@ renderCUDA(
 				// many that were affected by this Gaussian.
 				atomicAdd(&(dL_dcolors[global_id * C + ch]), dchannel_dcolor * dL_dchannel);
 			}
+
+			// Propagate gradients to per-Gaussian depths
+			const float c_d = collected_depths[j];
+			accum_depth_rec = last_alpha * last_depth + (1.f - last_alpha) * accum_depth_rec;
+			last_depth = c_d;
+			dL_dalpha += (c_d - accum_depth_rec) * dL_depth;
+			// for (int ch = 0; ch < C; ch++)
+			// {
+			// 	atomicAdd(&(dL_dcolors[global_id * C + ch]), dchannel_dcolor * dL_depth);
+			// }
+
 			dL_dalpha *= T;
+
+			// Propagate gradients from Ts to per-Gaussian alpha
+			
+			// in forward:
+
+			// final_T = last_T * (1.f - alpha)
+			// final_T = (last_last_T * (1.f - last_alpha)) * (1.f - alpha)
+			
+			// and here we have:
+			
+			// 'T = final_T / (1.f - alpha) = last_T'
+			// c_T = last_T * (1.f - alpha)
+			// dT_dalpha = -last_T
+			// dL_dalpha = dL_dT * dT_dalpha = dL_dT * -last_T
+			
+			// and also:
+			
+			// dT_dlast_T = (1.f - alpha)
+			// dL_dlast_T = dL_dT * dT_dlast_T
+
+			dL_dalpha += -T * dL_dT;
+			dL_dT *= (1.f - alpha);
+
 			// Update last alpha (to be used in the next iteration)
 			last_alpha = alpha;
 
@@ -630,9 +676,11 @@ void BACKWARD::render(
 	const float2* means2D,
 	const float4* conic_opacity,
 	const float* colors,
+	const float* depths,
 	const float* final_Ts,
 	const uint32_t* n_contrib,
 	const float* dL_dpixels,
+	const float* dL_depths,
 	float3* dL_dmean2D,
 	float4* dL_dconic2D,
 	float* dL_dopacity,
@@ -646,9 +694,11 @@ void BACKWARD::render(
 		means2D,
 		conic_opacity,
 		colors,
+		depths,
 		final_Ts,
 		n_contrib,
 		dL_dpixels,
+		dL_depths,
 		dL_dmean2D,
 		dL_dconic2D,
 		dL_dopacity,
